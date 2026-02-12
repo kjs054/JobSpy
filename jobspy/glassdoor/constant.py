@@ -3,17 +3,17 @@ headers = {
     "accept": "*/*",
     "accept-language": "en-US,en;q=0.9",
     "apollographql-client-name": "job-search-next",
-    "apollographql-client-version": "4.65.5",
+    "apollographql-client-version": "4.76.4",
     "content-type": "application/json",
     "origin": "https://www.glassdoor.com",
     "referer": "https://www.glassdoor.com/",
-    "sec-ch-ua": '"Chromium";v="118", "Google Chrome";v="118", "Not=A?Brand";v="99"',
+    "sec-ch-ua": '"Chromium";v="132", "Google Chrome";v="132", "Not_A Brand";v="24"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"macOS"',
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
 }
 query_template = """
         query JobSearchResultsQuery(
@@ -181,4 +181,6 @@ query_template = """
             __typename
         }
 """
-fallback_token = "Ft6oHEWlRZrxDww95Cpazw:0pGUrkb2y3TyOpAIqF2vbPmUXoXVkD3oEGDVkvfeCerceQ5-n8mBg3BovySUIjmCPHCaW0H2nQVdqzbtsYqf4Q:wcqRqeegRUa9MVLJGyujVXB7vWFPjdaS1CtrrzJq-ok"
+# No hardcoded fallback_token — force fresh CSRF token extraction.
+# Stale tokens silently cause all requests to fail with auth errors.
+fallback_token = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import time
 import requests
 from typing import Tuple
 from datetime import datetime, timedelta
@@ -64,7 +65,10 @@ class Glassdoor(Scraper):
             proxies=self.proxies, ca_cert=self.ca_cert, has_retry=True
         )
         token = self._get_csrf_token()
-        headers["gd-csrf-token"] = token if token else fallback_token
+        if not token:
+            log.error("Failed to obtain CSRF token, Glassdoor scraping may fail")
+        if token:
+            headers["gd-csrf-token"] = token
         if self.user_agent:
             headers["user-agent"] = self.user_agent
         self.session.headers.update(headers)
@@ -151,15 +155,38 @@ class Glassdoor(Scraper):
 
     def _get_csrf_token(self):
         """
-        Fetches csrf token needed for API by visiting a generic page
+        Fetches CSRF token needed for API by visiting a generic page.
+        Tries multiple URLs and regex patterns for resilience.
         """
-        res = self.session.get(f"{self.base_url}/Job/computer-science-jobs.htm")
-        pattern = r'"token":\s*"([^"]+)"'
-        matches = re.findall(pattern, res.text)
-        token = None
-        if matches:
-            token = matches[0]
-        return token
+        urls = [
+            f"{self.base_url}/Job/computer-science-jobs.htm",
+            f"{self.base_url}/Job/software-engineer-jobs.htm",
+            f"{self.base_url}/",
+        ]
+        patterns = [
+            r'"token":\s*"([^"]+)"',
+            r'gdCSRFToken["\']\s*[:=]\s*["\']([^"\']+)',
+            r'"gdToken":\s*"([^"]+)"',
+            r'csrf[Tt]oken["\']\s*[:=]\s*["\']([^"\']+)',
+        ]
+        for url in urls:
+            try:
+                res = self.session.get(url)
+                if not res.ok:
+                    continue
+                for pattern in patterns:
+                    matches = re.findall(pattern, res.text)
+                    if matches:
+                        token = matches[0]
+                        if isinstance(token, tuple):
+                            token = token[-1]
+                        if token and len(token) > 10:
+                            return token
+            except Exception as e:
+                log.warning(f"Failed to fetch CSRF token from {url}: {e}")
+                continue
+        log.error("Could not extract CSRF token from Glassdoor")
+        return None
 
     def _process_job(self, job_data):
         """
@@ -220,6 +247,8 @@ class Glassdoor(Scraper):
     def _fetch_job_description(self, job_id):
         """
         Fetches the job description for a single job ID.
+        Routes through the TLS-aware session instead of raw requests
+        to avoid Cloudflare blocks.
         """
         url = f"{self.base_url}/graph"
         body = [
@@ -246,42 +275,61 @@ class Glassdoor(Scraper):
                 """,
             }
         ]
-        res = requests.post(url, json=body, headers=headers)
-        if res.status_code != 200:
+        try:
+            res = self.session.post(url, data=json.dumps(body))
+            if res.status_code != 200:
+                return None
+            data = res.json()[0]
+            desc = data["data"]["jobview"]["job"]["description"]
+            if self.scraper_input.description_format == DescriptionFormat.MARKDOWN:
+                desc = markdown_converter(desc)
+            return desc
+        except Exception as e:
+            log.error(f"Failed to fetch job description for {job_id}: {e}")
             return None
-        data = res.json()[0]
-        desc = data["data"]["jobview"]["job"]["description"]
-        if self.scraper_input.description_format == DescriptionFormat.MARKDOWN:
-            desc = markdown_converter(desc)
-        return desc
 
     def _get_location(self, location: str, is_remote: bool) -> (int, str):
         if not location or is_remote:
             return "11047", "STATE"  # remote options
         url = f"{self.base_url}/findPopularLocationAjax.htm?maxLocationsToReturn=10&term={location}"
-        res = self.session.get(url)
-        if res.status_code != 200:
-            if res.status_code == 429:
-                err = f"429 Response - Blocked by Glassdoor for too many requests"
-                log.error(err)
-                return None, None
-            else:
-                err = f"Glassdoor response status code {res.status_code}"
-                err += f" - {res.text}"
-                log.error(f"Glassdoor response status code {res.status_code}")
-                return None, None
-        items = res.json()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                res = self.session.get(url)
+                if res.status_code == 200:
+                    items = res.json()
+                    if not items:
+                        raise ValueError(
+                            f"Location '{location}' not found on Glassdoor"
+                        )
+                    loc_type = items[0]["locationType"]
+                    loc_type_map = {"C": "CITY", "S": "STATE", "N": "COUNTRY"}
+                    location_type = loc_type_map.get(loc_type, loc_type)
+                    return int(items[0]["locationId"]), location_type
 
-        if not items:
-            raise ValueError(f"Location '{location}' not found on Glassdoor")
-        location_type = items[0]["locationType"]
-        if location_type == "C":
-            location_type = "CITY"
-        elif location_type == "S":
-            location_type = "STATE"
-        elif location_type == "N":
-            location_type = "COUNTRY"
-        return int(items[0]["locationId"]), location_type
+                if res.status_code == 429:
+                    wait = 2 ** (attempt + 1)
+                    log.warning(
+                        f"429 rate limit on Glassdoor location lookup, "
+                        f"retrying in {wait}s ({attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait)
+                    continue
+
+                log.error(
+                    f"Glassdoor location lookup failed: {res.status_code} - {res.text}"
+                )
+                return None, None
+            except ValueError:
+                raise
+            except Exception as e:
+                log.error(f"Glassdoor location lookup error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None, None
+        log.error("Glassdoor location lookup: max retries exceeded")
+        return None, None
 
     def _add_payload(
         self,
