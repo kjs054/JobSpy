@@ -18,7 +18,8 @@ from jobspy.linkedin.util import (
     job_type_code,
     parse_job_type,
     parse_job_level,
-    parse_company_industry
+    parse_company_industry,
+    parse_posted_date,
 )
 from jobspy.model import (
     JobPost,
@@ -126,6 +127,8 @@ class LinkedIn(Scraper):
                         err = (
                             f"429 Response - Blocked by LinkedIn for too many requests"
                         )
+                        log.error(err)
+                        return JobResponse(jobs=job_list, blocked=True)
                     else:
                         err = f"LinkedIn response status code {response.status_code}"
                         err += f" - {response.text}"
@@ -143,6 +146,8 @@ class LinkedIn(Scraper):
             if len(job_cards) == 0:
                 return JobResponse(jobs=job_list)
 
+            fetch_desc = scraper_input.linkedin_fetch_description
+            new_on_page = 0
             for job_card in job_cards:
                 href_tag = job_card.find("a", class_="base-card__full-link")
                 if href_tag and "href" in href_tag.attrs:
@@ -154,14 +159,22 @@ class LinkedIn(Scraper):
                     seen_ids.add(job_id)
 
                     try:
-                        fetch_desc = scraper_input.linkedin_fetch_description
+                        if fetch_desc:
+                            log.info(
+                                f"fetching description {len(job_list) + 1}/{scraper_input.results_wanted} (job {job_id})"
+                            )
                         job_post = self._process_job(job_card, job_id, fetch_desc)
                         if job_post:
                             job_list.append(job_post)
+                            new_on_page += 1
                         if not continue_search():
                             break
                     except Exception as e:
-                        raise LinkedInException(str(e))
+                        log.warning(f"Failed to parse job card {job_id}: {e}")
+                        continue
+            log.info(
+                f"page {request_count}: {new_on_page} new jobs, {len(job_list)} total"
+            )
 
             if continue_search():
                 time.sleep(random.uniform(self.delay, self.delay + self.band_delay))
@@ -217,13 +230,18 @@ class LinkedIn(Scraper):
         if datetime_tag and "datetime" in datetime_tag.attrs:
             datetime_str = datetime_tag["datetime"]
             try:
-                date_posted = datetime.strptime(datetime_str, "%Y-%m-%d")
+                date_posted = datetime.strptime(datetime_str, "%Y-%m-%d").date()
             except:
                 date_posted = None
         job_details = {}
         if full_descr:
             job_details = self._get_job_details(job_id)
+            if job_details.get("is_closed"):
+                return None
             description = job_details.get("description")
+            # Use detail page date as fallback when search card date is missing
+            if date_posted is None and job_details.get("date_posted"):
+                date_posted = job_details["date_posted"]
         is_remote = is_job_remote(title, description, location)
 
         return JobPost(
@@ -254,15 +272,31 @@ class LinkedIn(Scraper):
         """
         try:
             response = self.session.get(
-                f"{self.base_url}/jobs/view/{job_id}", timeout=5
+                f"{self.base_url}/jobs/view/{job_id}", timeout=10
             )
             response.raise_for_status()
-        except:
+        except Exception as e:
+            log.warning(f"Failed to fetch job details for {job_id}: {e}")
             return {}
         if "linkedin.com/signup" in response.url:
             return {}
 
         soup = BeautifulSoup(response.text, "html.parser")
+
+        # Detect closed/expired job listings
+        page_text = soup.get_text(separator=" ").lower()
+        closed_indicators = [
+            "no longer accepting applications",
+            "this job is no longer available",
+            "this job has expired",
+            "this job posting has expired",
+            "position has been filled",
+        ]
+        for indicator in closed_indicators:
+            if indicator in page_text:
+                log.info(f"Skipping closed job {job_id}: '{indicator}'")
+                return {"is_closed": True}
+
         div_content = soup.find(
             "div", class_=lambda x: x and "show-more-less-html__markup" in x
         )
@@ -299,6 +333,7 @@ class LinkedIn(Scraper):
             "job_url_direct": self._parse_job_url_direct(soup),
             "company_logo": company_logo,
             "job_function": job_function,
+            "date_posted": parse_posted_date(soup),
         }
 
     def _get_location(self, metadata_card: Optional[Tag]) -> Location:
@@ -322,8 +357,11 @@ class LinkedIn(Scraper):
                     country=Country.from_string(self.country),
                 )
             elif len(parts) == 3:
-                city, state, country = parts
-                country = Country.from_string(country)
+                city, state, country_str = parts
+                try:
+                    country = Country.from_string(country_str)
+                except ValueError:
+                    country = Country.from_string(self.country)
                 location = Location(city=city, state=state, country=country)
         return location
 

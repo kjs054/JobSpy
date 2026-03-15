@@ -1,3 +1,6 @@
+import re
+from datetime import date, datetime, timedelta
+
 from bs4 import BeautifulSoup
 
 from jobspy.model import JobType, Location
@@ -83,6 +86,51 @@ def parse_company_industry(soup_industry: BeautifulSoup) -> str | None:
             industry = industry_span.get_text(strip=True)
 
     return industry
+
+
+def parse_relative_date(text: str) -> date | None:
+    """
+    Parses relative date text like '2 weeks ago' or 'Reposted 3 days ago'
+    into an approximate absolute datetime.
+    """
+    if not text:
+        return None
+    text = text.strip().lower()
+    # Strip "reposted" prefix
+    text = re.sub(r"^reposted\s+", "", text)
+
+    match = re.search(r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago", text)
+    if not match:
+        return None
+
+    value = int(match.group(1))
+    unit = match.group(2)
+    now = datetime.now()
+
+    deltas = {
+        "second": timedelta(seconds=value),
+        "minute": timedelta(minutes=value),
+        "hour": timedelta(hours=value),
+        "day": timedelta(days=value),
+        "week": timedelta(weeks=value),
+        "month": timedelta(days=value * 30),
+        "year": timedelta(days=value * 365),
+    }
+    delta = deltas.get(unit)
+    if delta:
+        return (now - delta).date()
+    return None
+
+
+def parse_posted_date(soup: BeautifulSoup) -> date | None:
+    """
+    Extracts posted date from LinkedIn job detail page.
+    Looks for the 'posted-time-ago__text' span with relative date text.
+    """
+    time_tag = soup.find("span", class_=lambda c: c and "posted-time-ago__text" in c)
+    if time_tag:
+        return parse_relative_date(time_tag.get_text(strip=True))
+    return None
 
 
 def is_job_remote(title: dict, description: str, location: Location) -> bool:

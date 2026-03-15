@@ -208,6 +208,7 @@ class Location(BaseModel):
 class CompensationInterval(Enum):
     YEARLY = "yearly"
     MONTHLY = "monthly"
+    BIWEEKLY = "biweekly"
     WEEKLY = "weekly"
     DAILY = "daily"
     HOURLY = "hourly"
@@ -282,6 +283,7 @@ class JobPost(BaseModel):
 
 class JobResponse(BaseModel):
     jobs: list[JobPost] = []
+    blocked: bool = False
 
 
 class Site(Enum):

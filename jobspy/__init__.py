@@ -126,6 +126,11 @@ def scrape_jobs(
             site_value, scraped_data = future.result()
             site_to_jobs_dict[site_value] = scraped_data
 
+    # Collect sites that reported being blocked (403/429)
+    blocked_sites = [
+        site for site, response in site_to_jobs_dict.items() if response.blocked
+    ]
+
     jobs_dfs: list[pd.DataFrame] = []
 
     for site, job_response in site_to_jobs_dict.items():
@@ -214,11 +219,15 @@ def scrape_jobs(
         jobs_df = jobs_df[desired_order]
 
         # Step 4: Sort the DataFrame as required
-        return jobs_df.sort_values(
+        jobs_df = jobs_df.sort_values(
             by=["site", "date_posted"], ascending=[True, False]
         ).reset_index(drop=True)
+        jobs_df.attrs["blocked_sites"] = blocked_sites
+        return jobs_df
     else:
-        return pd.DataFrame()
+        df = pd.DataFrame()
+        df.attrs["blocked_sites"] = blocked_sites
+        return df
 
 
 # Add BDJobs to __all__

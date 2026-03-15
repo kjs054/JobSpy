@@ -46,6 +46,7 @@ class Indeed(Scraper):
         self.api_country_code = None
         self.base_url = None
         self.api_url = "https://apis.indeed.com/graphql"
+        self.blocked = False
 
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
         """
@@ -64,6 +65,8 @@ class Indeed(Scraper):
         cursor = None
 
         while len(self.seen_urls) < scraper_input.results_wanted + scraper_input.offset:
+            if self.blocked:
+                break
             log.info(
                 f"search page: {page} / {math.ceil(scraper_input.results_wanted / self.jobs_per_page)}"
             )
@@ -77,7 +80,8 @@ class Indeed(Scraper):
             jobs=job_list[
                 scraper_input.offset : scraper_input.offset
                 + scraper_input.results_wanted
-            ]
+            ],
+            blocked=self.blocked,
         )
 
     def _scrape_page(self, cursor: str | None) -> Tuple[list[JobPost], str | None]:
@@ -118,9 +122,16 @@ class Indeed(Scraper):
             verify=False,
         )
         if not response.ok:
-            log.info(
-                f"responded with status code: {response.status_code} (submit GitHub issue if this appears to be a bug)"
-            )
+            if response.status_code in (403, 429):
+                self.blocked = True
+                log.error(
+                    f"{response.status_code} - Indeed is blocking the request. "
+                    "Try using a proxy."
+                )
+            else:
+                log.info(
+                    f"responded with status code: {response.status_code} (submit GitHub issue if this appears to be a bug)"
+                )
             return jobs, new_cursor
         data = response.json()
         jobs = data["data"]["jobSearch"]["results"]
@@ -192,6 +203,29 @@ class Indeed(Scraper):
                 """
         return filters_str
 
+    @staticmethod
+    def _parse_location(loc: dict) -> Location:
+        """Parse location from Indeed API response.
+
+        Uses admin1Code when available, falls back to extracting state
+        from formatted.short (e.g. "Plano, TX") when admin1Code is null.
+        """
+        import re
+
+        city = loc.get("city")
+        state = loc.get("admin1Code")
+        country = loc.get("countryCode")
+
+        if not state:
+            formatted = loc.get("formatted") or {}
+            short = formatted.get("short") or formatted.get("long") or ""
+            # Extract 2-letter state code from "City, ST" or "City, ST 12345"
+            m = re.search(r",\s*([A-Z]{2})\b", short)
+            if m:
+                state = m.group(1)
+
+        return Location(city=city, state=state, country=country)
+
     def _process_job(self, job: dict) -> JobPost | None:
         """
         Parses the job dict into JobPost model
@@ -221,11 +255,7 @@ class Indeed(Scraper):
             company_url_direct=(
                 employer["links"]["corporateWebsite"] if employer else None
             ),
-            location=Location(
-                city=job.get("location", {}).get("city"),
-                state=job.get("location", {}).get("admin1Code"),
-                country=job.get("location", {}).get("countryCode"),
-            ),
+            location=self._parse_location(job.get("location", {})),
             job_type=job_type,
             compensation=get_compensation(job["compensation"]),
             date_posted=date_posted,
