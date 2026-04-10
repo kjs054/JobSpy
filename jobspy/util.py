@@ -65,6 +65,7 @@ class RequestsRotating(RotatingProxySession, requests.Session):
             retries = Retry(
                 total=3,
                 connect=3,
+                read=0,
                 status=3,
                 status_forcelist=[500, 502, 503, 504, 429],
                 backoff_factor=delay,

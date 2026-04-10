@@ -200,33 +200,42 @@ class ZipRecruiter(Scraper):
                 return []
 
         soup = BeautifulSoup(html, "html.parser")
+
+        # Try legacy application/json script tag first, then RSC payload
+        page_data = None
         app_json_tag = soup.find("script", type="application/json")
-        if not app_json_tag or not app_json_tag.string:
-            log.error("No application/json script tag found on ZipRecruiter page")
-            return []
+        if app_json_tag and app_json_tag.string:
+            try:
+                page_data = json.loads(app_json_tag.string)
+            except json.JSONDecodeError:
+                pass
 
-        try:
-            page_data = json.loads(app_json_tag.string)
-        except json.JSONDecodeError:
-            log.error("Failed to parse ZipRecruiter page JSON")
-            return []
+        if page_data:
+            # Legacy format: listJobKeysResponse + getJobDetailsResponse
+            return self._parse_legacy_search_page(page_data, html)
 
-        # Extract listing keys
+        # New format: RSC payload with serializedJobCardsData
+        cards_data = self._extract_cards_from_rsc(html)
+        if cards_data:
+            return self._parse_rsc_search_page(cards_data)
+
+        log.error("No job data found on ZipRecruiter search page")
+        return []
+
+    def _parse_legacy_search_page(self, page_data: dict, html: str) -> list[JobPost]:
+        """Parse the legacy application/json format (listJobKeysResponse)."""
         keys_resp = page_data.get("listJobKeysResponse", {})
         job_keys = keys_resp.get("jobKeys", [])
         if not job_keys:
             log.info("No job keys found on page")
             return []
 
-        # First job has full details from the search page SSR
         first_details = page_data.get("getJobDetailsResponse", {}).get(
             "jobDetails", {}
         )
         first_key = first_details.get("listingKey") if first_details else None
 
         jobs = []
-
-        # Parse the first job from SSR data (search page renders its detail view)
         if first_details and first_key:
             job = self._parse_zr_details(first_details)
             if job:
@@ -234,8 +243,6 @@ class ZipRecruiter(Scraper):
                     job.company_url = self._extract_company_website_from_html(html)
                 jobs.append(job)
 
-        # Fetch remaining jobs' detail pages with limited concurrency.
-        # Too many parallel requests triggers ZR rate limiting / connection drops.
         remaining_keys = [
             k["listingKey"] for k in job_keys if k["listingKey"] != first_key
         ]
@@ -252,6 +259,81 @@ class ZipRecruiter(Scraper):
                             jobs.append(job)
                     except Exception as e:
                         log.error(f"Failed to fetch job detail: {e}")
+
+        return jobs
+
+    def _extract_cards_from_rsc(self, html_text: str) -> dict | None:
+        """Extract serializedJobCardsData from RSC self.__next_f.push() payload."""
+        soup = BeautifulSoup(html_text, "html.parser")
+        for script in soup.find_all("script"):
+            text = script.string
+            if not text or "serializedJobCardsData" not in text:
+                continue
+
+            # Extract the string payload from self.__next_f.push([1,"..."])
+            import re
+            match = re.search(
+                r'self\.__next_f\.push\(\[1,"(.*)"\]\)', text, re.DOTALL
+            )
+            if not match:
+                continue
+
+            try:
+                decoded = json.loads('"' + match.group(1) + '"')
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            # Bracket-match serializedJobCardsData:{...}
+            marker = '"serializedJobCardsData":'
+            idx = decoded.find(marker)
+            if idx < 0:
+                continue
+
+            start = decoded.find("{", idx + len(marker))
+            if start < 0:
+                continue
+
+            depth = 0
+            for i in range(start, len(decoded)):
+                if decoded[i] == "{":
+                    depth += 1
+                elif decoded[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(decoded[start : i + 1])
+                        except json.JSONDecodeError:
+                            break
+
+        return None
+
+    def _parse_rsc_search_page(self, cards_data: dict) -> list[JobPost]:
+        """Parse jobs from the RSC serializedJobCardsData format.
+
+        The card data includes title, company, location, pay, employment type,
+        and posted date — everything except the full description. We use
+        shortDescription as a lightweight fallback rather than fetching each
+        detail page (which are Cloudflare-protected and cause timeouts).
+        """
+        job_keys = cards_data.get("jobKeys", [])
+        job_map = cards_data.get("jobKeysMap", {})
+
+        if not job_keys or not job_map:
+            log.info("No job data in RSC payload")
+            return []
+
+        log.info(f"Found {len(job_keys)} jobs in RSC payload")
+
+        jobs = []
+        for key_entry in job_keys:
+            listing_key = key_entry.get("listingKey", "")
+            details = job_map.get(listing_key)
+            if not details:
+                continue
+
+            job = self._parse_zr_details(details)
+            if job:
+                jobs.append(job)
 
         return jobs
 
@@ -693,17 +775,24 @@ class ZipRecruiter(Scraper):
                     is_remote = True
                     break
 
-        # Description
+        # Description — prefer full HTML, fall back to shortDescription
         description = details.get("htmlFullDescription", "")
         if isinstance(description, str) and description.startswith("$"):
             # RSC reference - description is loaded separately
             description = ""
+        if not description:
+            description = details.get("shortDescription", "")
         if (
             description
             and self.scraper_input
             and self.scraper_input.description_format == DescriptionFormat.MARKDOWN
         ):
             description = markdown_converter(description)
+
+        # Prefer SEO URL (canonical /c/Company/Job/Title/-in-Location?jid=...)
+        seo_path = details.get("rawCanonicalZipJobPageUrl", "")
+        if seo_path:
+            job_url = f"{self.base_url}{seo_path}"
 
         return JobPost(
             id=f"zr-{listing_key}",
